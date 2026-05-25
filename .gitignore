@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Generated data and plots
+*.pkl
+*.npy
+*.npz
+task1/plots/
+
+# Downloaded datasets
+task1/GiantMIDI-Piano-master/midis/
