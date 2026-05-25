@@ -1,5 +1,4 @@
 import pickle
-import math
 from collections import Counter
 from pathlib import Path
 
@@ -54,6 +53,7 @@ def save_sequence_length_histogram(sequence_lengths, output_file, trim_percent=9
     plt.savefig(output_file)
     plt.close()
 
+
 # look at each training/testing example, specifically last input note -> target next note
 # count how many times each interval (target - last input) occurs
 # tells us if the pitch tends to make small or big jumps between notes
@@ -84,6 +84,46 @@ def save_interval_histogram(interval_counts, output_file):
     plt.close()
 
 
+def get_transition_counts(data):
+    int_to_pitch = data["int_to_pitch"]
+    x_all = data["x_train"] + data["x_test"]
+    y_all = data["y_train"] + data["y_test"]
+    transition_counts = Counter()
+
+    for sequence, target in zip(x_all, y_all):
+        previous_pitch = int_to_pitch[sequence[-1]]
+        next_pitch = int_to_pitch[target]
+        transition_counts[(previous_pitch, next_pitch)] += 1
+
+    return transition_counts
+
+
+def save_transition_heatmap(transition_counts, pitch_counts, output_file, top_n=15):
+    top_pitches = sorted(pitch for pitch, _ in pitch_counts.most_common(top_n))
+    pitch_to_pos = {pitch: i for i, pitch in enumerate(top_pitches)}
+    matrix = [[0 for _ in top_pitches] for _ in top_pitches]
+
+    for (previous_pitch, next_pitch), count in transition_counts.items():
+        if previous_pitch in pitch_to_pos and next_pitch in pitch_to_pos:
+            row = pitch_to_pos[previous_pitch]
+            col = pitch_to_pos[next_pitch]
+            matrix[row][col] = count
+
+    _, ax = plt.subplots(figsize=(9, 7))
+    image = ax.imshow(matrix, aspect="auto")
+    plt.colorbar(image, ax=ax, label="Transition count")
+    ax.set_xticks(range(len(top_pitches)))
+    ax.set_yticks(range(len(top_pitches)))
+    ax.set_xticklabels(top_pitches, rotation=45, ha="right")
+    ax.set_yticklabels(top_pitches)
+    ax.set_xlabel("Next MIDI pitch")
+    ax.set_ylabel("Previous MIDI pitch")
+    ax.set_title(f"Pitch transition heatmap - top {top_n} pitches")
+    plt.tight_layout()
+    plt.savefig(output_file)
+    plt.close()
+
+
 # how many times each MIDI pitch appears in the dataset
 def get_pitch_counts(data):
 # if .pkl already has pitch counts, use them. 
@@ -108,9 +148,12 @@ def main():
     interval_plot = PLOTS_DIR / "next_note_intervals.png"
     save_interval_histogram(interval_counts, interval_plot)
 
+    transition_counts = get_transition_counts(data)
+    transition_plot = PLOTS_DIR / "pitch_transition_heatmap.png"
+    save_transition_heatmap(transition_counts, pitch_counts, transition_plot)
+
     sequence_lengths = data.get("sequence_lengths", [])
     length_plot = PLOTS_DIR / "song_lengths.png"
-    log_length_plot = PLOTS_DIR / "song_lengths_log.png"
     if sequence_lengths:
         save_sequence_length_histogram(sequence_lengths, length_plot)
     total_notes = sum(pitch_counts.values())
@@ -127,6 +170,7 @@ def main():
     print(f"Testing examples: {len(data['x_test'])}")
     print(f"Saved pitch histogram: {pitch_plot}")
     print(f"Saved next-note interval histogram: {interval_plot}")
+    print(f"Saved pitch transition heatmap: {transition_plot}")
 
     if sequence_lengths:
         print(f"Shortest song: {min(sequence_lengths)} notes")
@@ -134,7 +178,6 @@ def main():
         print(f"Average song length: {sum(sequence_lengths) / len(sequence_lengths):.1f} notes")
         print(f"95th percentile song length: {percentile(sequence_lengths, 95)} notes")
         print(f"Saved song length histogram: {length_plot}")
-        print(f"Saved log song length histogram: {log_length_plot}")
     else:
         print("Song lengths not found. Re-run data.py to include song length metadata.")
 
