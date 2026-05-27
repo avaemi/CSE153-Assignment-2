@@ -403,6 +403,23 @@ def final_evaluation(model, test_loader, baseline_accuracy, idx_to_chord):
         else:
             print("LSTM doesn't beat baseline\n")
 
+        # Bar chart: Baseline vs LSTM test accuracy
+        fig, ax = plt.subplots(figsize=(6, 5))
+        labels = ['Baseline', 'LSTM']
+        accs = [baseline_accuracy, test_acc]
+        colors = ['#d9534f', '#5cb85c']
+        bars = ax.bar(labels, accs, color=colors, width=0.5)
+        for bar, acc in zip(bars, accs):
+            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.005,
+                    f'{acc:.2%}', ha='center', va='bottom', fontsize=12, fontweight='bold')
+        ax.set_ylabel('Chord Accuracy')
+        ax.set_title('Test Accuracy: Baseline vs LSTM')
+        ax.set_ylim(0, max(accs) * 1.3)
+        ax.grid(True, alpha=0.3, axis='y')
+        plt.tight_layout()
+        plt.savefig(os.path.join(OUTPUT_DIR, 'test_accuracy_comparison.png'), dpi=150)
+        plt.close()
+
         return test_acc, test_loss
 
 
