@@ -23,10 +23,10 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
 # Hyperparameters
-EMBED_DIM = 32          # melody note embedding size
+EMBED_DIM = 64          # melody note embedding size
 HIDDEN_DIM = 256        # LSTM hidden units
 NUM_LAYERS = 2          # stacked LSTM layers
-DROPOUT = 0.3           # dropout between LSTM layers and on embeddings
+DROPOUT = 0.5           # dropout between LSTM layers and on embeddings
 LEARNING_RATE = 1e-3
 BATCH_SIZE = 32
 NUM_EPOCHS = 120
@@ -40,13 +40,52 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
 
+# Data Augmentation
+def augment_by_transposition(encoded_sequences, idx_to_note, note_to_idx,
+                             idx_to_chord, chord_to_idx):
+    """Augments training data by transposing chorales into different keys."""
+    augmented = list(encoded_sequences)  # keep originals
+
+    for shift in range(-5, 7):  # -5, -4, ..., +5, +6 semitones
+        if shift == 0:
+            continue  # already have the original
+        for seq in encoded_sequences:
+            transposed_seq = []
+            valid = True
+            for note_idx, chord_idx in seq:
+                # Transpose melody note
+                orig_note = idx_to_note.get(note_idx)
+                if orig_note is None or not isinstance(orig_note, int):
+                    valid = False
+                    break
+                new_note = orig_note + shift
+                new_note_idx = note_to_idx.get(new_note)
+                if new_note_idx is None:
+                    valid = False
+                    break
+
+                # Transpose chord (set of MIDI pitches)
+                orig_chord = idx_to_chord.get(chord_idx)
+                if orig_chord is None or not isinstance(orig_chord, frozenset):
+                    valid = False
+                    break
+                new_chord = frozenset(p + shift for p in orig_chord)
+                new_chord_idx = chord_to_idx.get(new_chord)
+                if new_chord_idx is None:
+                    valid = False
+                    break
+
+                transposed_seq.append((new_note_idx, new_chord_idx))
+
+            if valid and len(transposed_seq) == len(seq):
+                augmented.append(transposed_seq)
+
+    return augmented
+
+
 # Dataset
 class ChoraleDataset(Dataset):
-    """Wraps encoded chorale sequences for DataLoader.
-
-    Each item is a single chorale: a list of (note_idx, chord_idx) pairs.
-    Store them as separate integer tensors for melody (input) and chords (target).
-    """
+    """Dataset wrapper that stores melodies (inputs) and chords (targets) as tensors."""
 
     def __init__(self, encoded_sequences):
         self.melodies = []
@@ -65,13 +104,7 @@ class ChoraleDataset(Dataset):
 
 
 def collate_fn(batch):
-    """Pad variable-length chorales to the longest sequence in the batch.
-
-    Returns:
-        melodies:  (batch, max_len)  padded with 0 (PAD token)
-        chords:    (batch, max_len)  padded with -1 so CrossEntropyLoss ignores them
-        lengths:   (batch,)          original sequence lengths for pack_padded_sequence
-    """
+    """Pads chorales in a batch so they all have the same length."""
     melodies, chords = zip(*batch)
     lengths = torch.tensor([len(m) for m in melodies], dtype=torch.long)
 
@@ -85,12 +118,8 @@ def collate_fn(batch):
 
 # Model
 class MelodyToChordLSTM(nn.Module):
-    """LSTM model that reads a melody note sequence and predicts a chord at each timestep.
+    """LSTM model that predicts the accompanying chord for each melody note.
     Involves: melody_note -> Embedding -> Dropout -> LSTM (2-layer) -> Dropout -> Linear -> chord_logits
-
-    Embedding captures pitch relationships (nearby MIDI notes get similar vectors).
-    Two LSTM layers let the model learn both local voice-leading patterns and longer
-    phrase-level harmonic progressions. Dropout helps prevent overfitting on the dataset.
     """
 
     def __init__(self, note_vocab_size, chord_vocab_size, embed_dim, hidden_dim,
@@ -106,21 +135,15 @@ class MelodyToChordLSTM(nn.Module):
             num_layers=num_layers,
             batch_first=True,
             dropout=dropout if num_layers > 1 else 0.0,
-            bidirectional=False,
+            bidirectional=True,
         )
 
         self.output_dropout = nn.Dropout(dropout)
-        self.fc = nn.Linear(hidden_dim, chord_vocab_size)
+        # Multiply hidden_dim by 2 because the LSTM is bidirectional
+        self.fc = nn.Linear(hidden_dim * 2, chord_vocab_size)
 
     def forward(self, melodies, lengths):
-        """
-        Parameters:
-            melodies: (batch, max_len) integer melody note indices
-            lengths:  (batch,) original sequence lengths
-
-        Returns:
-            logits: (batch, max_len, chord_vocab_size)
-        """
+        """Passes the melody through the embedding and LSTM layers to predict chords."""
         # Embed melody notes
         x = self.embedding(melodies)            # (batch, max_len, embed_dim)
         x = self.embed_dropout(x)
@@ -139,7 +162,7 @@ class MelodyToChordLSTM(nn.Module):
 
 # Training
 def train_one_epoch(model, loader, optimizer, criterion):
-    """Run one training epoch and return avg loss."""
+    """Trains the model for a single epoch and returns the average loss."""
     model.train()
     total_loss = 0.0
     total_tokens = 0
@@ -171,13 +194,23 @@ def train_one_epoch(model, loader, optimizer, criterion):
     return total_loss / total_tokens
 
 
-def evaluate(model, loader, criterion):
-    """Run eval and return avg loss and chord acc."""
+def partial_similarity(set_a, set_b):
+    """Calculates the percentage of overlapping notes between two chords."""
+    if not set_a and not set_b:
+        return 1.0
+    intersection = len(set_a & set_b)
+    union = len(set_a | set_b)
+    return intersection / union if union > 0 else 0.0
+
+
+def evaluate(model, loader, criterion, idx_to_chord=None):
+    """Evaluates the model on a dataset and returns loss and accuracy metrics."""
     with torch.no_grad():
         model.eval()
         total_loss = 0.0
         total_tokens = 0
         correct = 0
+        partial_match_sum = 0.0
 
         for melodies, chords, lengths in loader:
             melodies = melodies.to(DEVICE)
@@ -196,21 +229,33 @@ def evaluate(model, loader, criterion):
             preds = logits_flat.argmax(dim=-1)
             correct += (preds[mask] == chords_flat[mask]).sum().item()
 
+            # Partial match acc
+            if idx_to_chord is not None:
+                pred_masked = preds[mask].cpu().numpy()
+                true_masked = chords_flat[mask].cpu().numpy()
+                for p, t in zip(pred_masked, true_masked):
+                    pred_chord = idx_to_chord.get(int(p), frozenset())
+                    true_chord = idx_to_chord.get(int(t), frozenset())
+                    pred_set = set(pred_chord) if isinstance(pred_chord, frozenset) else set()
+                    true_set = set(true_chord) if isinstance(true_chord, frozenset) else set()
+                    partial_match_sum += partial_similarity(pred_set, true_set)
+
             num_tokens = mask.sum().item()
             total_loss += loss.item() * num_tokens
             total_tokens += num_tokens
 
         avg_loss = total_loss / total_tokens
         accuracy = correct / total_tokens
-        return avg_loss, accuracy
+        partial_match_acc = partial_match_sum / total_tokens if idx_to_chord is not None else None
+        return avg_loss, accuracy, partial_match_acc
 
 
 def train_model(model, train_loader, val_loader, num_epochs, learning_rate, patience):
-    """Model training using early stopping, LR scheduling, and metric logging."""
-    criterion = nn.CrossEntropyLoss(ignore_index=-1)
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-5)
+    """Full training loop that saves the best model and manages the learning rate."""
+    criterion = nn.CrossEntropyLoss(ignore_index=-1, label_smoothing=0.1)
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=5
+        optimizer, mode='min', factor=0.5, patience=8
     )
 
     history = {
@@ -229,8 +274,8 @@ def train_model(model, train_loader, val_loader, num_epochs, learning_rate, pati
 
     for epoch in range(1, num_epochs + 1):
         train_loss = train_one_epoch(model, train_loader, optimizer, criterion)
-        val_loss, val_acc = evaluate(model, val_loader, criterion)
-        _, train_acc = evaluate(model, train_loader, criterion)
+        val_loss, val_acc, _ = evaluate(model, val_loader, criterion)
+        _, train_acc, _ = evaluate(model, train_loader, criterion)
 
         current_lr = optimizer.param_groups[0]['lr']
         history['train_loss'].append(train_loss)
@@ -267,7 +312,7 @@ def train_model(model, train_loader, val_loader, num_epochs, learning_rate, pati
 
 # Plotting Curves
 def plot_training_curves(history, baseline_accuracy):
-    """Save plots for training and validation loss, accuracy, and learning rate."""
+    """Generates and saves graphs for loss, accuracy, and learning rate over time."""
 
     epochs = range(1, len(history['train_loss']) + 1)
 
@@ -318,12 +363,10 @@ def plot_training_curves(history, baseline_accuracy):
 
 # MIDI Generation
 def generate_midi(model, test_dataset, idx_to_note, idx_to_chord, num_chorales=3):
-    """Predict chords for test chorales and save as MIDI files.
-
-    For each selected test chorale:
-    - Feed the ground-truth melody into the model
-    - Take the chord prediction at each timestep
-    - Reconstruct a 4-voice MIDI file (soprano + predicted alto/tenor/bass)
+    """Predicts chords for the test set and saves the result as playable MIDI files.
+            - Feed the ground-truth melody into the model
+            - Take the chord prediction at each timestep
+            - Reconstruct a 4-voice MIDI file (soprano + predicted alto/tenor/bass)
     """
     try:
         from midiutil import MIDIFile
@@ -385,42 +428,43 @@ def generate_midi(model, test_dataset, idx_to_note, idx_to_chord, num_chorales=3
 
 # Final Eval Summary
 def final_evaluation(model, test_loader, baseline_accuracy, idx_to_chord):
-    """Print a detailed summary comparing LSTM accuracy to baseline on the test set."""
+    """Prints final metrics and saves a bar chart comparing the model to the baseline."""
     with torch.no_grad():
         model.eval()
         criterion = nn.CrossEntropyLoss(ignore_index=-1)
-        test_loss, test_acc = evaluate(model, test_loader, criterion)
+        test_loss, test_acc, partial_match_acc = evaluate(model, test_loader, criterion, idx_to_chord)
 
         print("\n")
         print("Final Test Set Eval:\n")
         print(f"Baseline accuracy: {baseline_accuracy:.4f}  ({baseline_accuracy:.2%})")
-        print(f"LSTM model test accuracy: {test_acc:.4f}  ({test_acc:.2%})")
+        print(f"LSTM exact match accuracy: {test_acc:.4f}  ({test_acc:.2%})")
+        print(f"LSTM partial match accuracy: {partial_match_acc:.4f}  ({partial_match_acc:.2%})")
         print(f"LSTM model test loss: {test_loss:.4f}")
         improvement = test_acc - baseline_accuracy
-        print(f"Improvement over baseline: {improvement:+.4f}  ({improvement:+.2%})")
+        print(f"Improvement over baseline (exact): {improvement:+.4f}  ({improvement:+.2%})")
         if test_acc > baseline_accuracy:
             print("LSTM beats baseline\n")
         else:
             print("LSTM doesn't beat baseline\n")
 
-        # Bar chart: Baseline vs LSTM test accuracy
-        fig, ax = plt.subplots(figsize=(6, 5))
-        labels = ['Baseline', 'LSTM']
-        accs = [baseline_accuracy, test_acc]
-        colors = ['#d9534f', '#5cb85c']
+        # Bar chart: Baseline vs LSTM exact match vs LSTM partial match
+        fig, ax = plt.subplots(figsize=(8, 5))
+        labels = ['Baseline\n(Exact Match)', 'LSTM\n(Exact Match)', 'LSTM\n(Partial Match)']
+        accs = [baseline_accuracy, test_acc, partial_match_acc]
+        colors = ['#d9534f', '#5cb85c', '#337ab7']
         bars = ax.bar(labels, accs, color=colors, width=0.5)
         for bar, acc in zip(bars, accs):
             ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.005,
                     f'{acc:.2%}', ha='center', va='bottom', fontsize=12, fontweight='bold')
         ax.set_ylabel('Chord Accuracy')
-        ax.set_title('Test Accuracy: Baseline vs LSTM')
+        ax.set_title('Test Accuracy: Baseline vs LSTM (Exact Match & Partial Match)')
         ax.set_ylim(0, max(accs) * 1.3)
         ax.grid(True, alpha=0.3, axis='y')
         plt.tight_layout()
         plt.savefig(os.path.join(OUTPUT_DIR, 'test_accuracy_comparison.png'), dpi=150)
         plt.close()
 
-        return test_acc, test_loss
+        return test_acc, test_loss, partial_match_acc
 
 
 
@@ -446,8 +490,15 @@ def main():
     print(f"Baseline accuracy: {baseline_accuracy:.4f}")
 
 
+    # Augment training data with transposition
+    original_count = len(encoded_data['train'])
+    augmented_train = augment_by_transposition(
+        encoded_data['train'], idx_to_note, note_to_idx, idx_to_chord, chord_to_idx
+    )
+    print(f"Data augmentation: {original_count} -> {len(augmented_train)} training chorales")
+
     # Create datasets and dataloaders
-    train_dataset = ChoraleDataset(encoded_data['train'])
+    train_dataset = ChoraleDataset(augmented_train)
     val_dataset = ChoraleDataset(encoded_data['valid'])
     test_dataset = ChoraleDataset(encoded_data['test'])
 
@@ -487,7 +538,7 @@ def main():
 
 
     # Final eval on test set
-    test_acc, test_loss = final_evaluation(model, test_loader, baseline_accuracy, idx_to_chord)
+    test_acc, test_loss, partial_match_acc = final_evaluation(model, test_loader, baseline_accuracy, idx_to_chord)
 
 
     # Generate MIDI output
